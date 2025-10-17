@@ -1,12 +1,43 @@
 import express from "express";
 import bcrypt from "bcrypt";
 
-import { User } from "../bd.js"; // IMPORT MODIFIÉ
-// IMPORT MODIFIÉ: isOwnerOrAdmin gère la logique admin/propriétaire
+import { User } from "../bd.js"; 
 import { isAdmin, isOwnerOrAdmin, authenticate } from "../middlewares/authentication-middleware.js"; 
 import { isValidID, userExists } from "../middlewares/params-middleware.js";
+// NOUVEL IMPORT des middlewares de validation Yup
+import { validateUser, validateUserUpdate } from "../middlewares/validation-middleware.js"; //
 
 const router = express.Router();
+
+// ===================================
+// CRUD - CREATE (Inscription - Public) - Conforme à "Users can create accounts without authentication."
+// ===================================
+// POST /users - Inscription utilisateur
+router.post("/", validateUser, async (request, response) => { // Ajout de validateUser
+    try {
+        const newUser = new User({ 
+            email: request.body.email,
+            username: request.body.username,
+            password: request.body.password,
+            role: 'user' // Force le rôle à 'user' pour toutes les inscriptions publiques.
+        });
+
+        await newUser.save();
+
+        const userResponse = { id: newUser._id, email: newUser.email, username: newUser.username, role: newUser.role };
+        response.status(201).json({ message: `Bienvenue ${newUser.username}, ton compte a été créé avec succès.`, user: userResponse });
+    } catch (error) {
+        if (error.code === 11000) {
+            return response.status(409).json({ message: "Email déjà existant, veuillez utiliser une autre adresse !" });
+        }
+        response.status(500).json({ message: "Erreur lors de l'inscription.", error: error.message });
+    }
+});
+
+
+// ===================================
+// CRUD - READ 
+// ===================================
 
 // GET /users - Lister tous les utilisateurs (Admin requis)
 router.get("/", authenticate, isAdmin, async (request, response) => {
@@ -14,68 +45,68 @@ router.get("/", authenticate, isAdmin, async (request, response) => {
   response.status(200).json(users);
 });
 
+// GET /users/me - Obtenir les détails de l'utilisateur actuel (via JWT ID)
+// Remplace l'ancienne route /my_account
+router.get("/me", authenticate, async (request, response) => { //
+  try {
+    const user = await User.findById(request.user.userID).select('-password'); 
+
+    if (!user) {
+        return response.status(404).json({ message: "Utilisateur introuvable." }); 
+    }
+    
+    response.status(200).json(user);
+  } catch (error) {
+    response.status(500).json({ message: "Erreur lors de la récupération du compte.", error });
+  }
+});
+
+
 // GET /users/:id - Voir un utilisateur spécifique (Admin ou Propriétaire requis)
 router.get("/:id", authenticate, isValidID, userExists, isOwnerOrAdmin, async (request, response) => {
   const user = await User.findById(request.params.id).select('-password');
-  if (request.user.userRole !== 'admin' && request.user.userID.toString() !== request.params.id) {
-        return response.status(401).json({ message: "Accès non autorisé à cet utilisateur." });
-  }
-
-  // Le mot de passe est déjà exclu par .select('-password')
+  // La vérification d'autorisation est gérée par isOwnerOrAdmin.
+  
   response.status(200).json(user);
 });
 
-// PUT /users/:id - Mettre à jour un utilisateur (Admin ou Propriétaire requis)
-router.put("/:id", authenticate, isValidID, userExists, isOwnerOrAdmin, async (request, response) => {
+
+// ===================================
+// CRUD - UPDATE/DELETE (Propriétaire ou Admin requis)
+// ===================================
+
+// PUT /users/:id - Mettre à jour un utilisateur (Admin ou Propriétaire requis, Validation requise)
+router.put("/:id", authenticate, isValidID, userExists, isOwnerOrAdmin, validateUserUpdate, async (request, response) => { // Ajout de validateUserUpdate
   const id = request.params.id;
-  const user = await User.findById(id).select('+password'); // On sélectionne le password pour la comparaison de l'email
-  const newEmailUser = await User.findOne({ email: request.body.email});
-
-  // Empêcher les utilisateurs non-admin de voir d'autres comptes (déjà géré par isOwnerOrAdmin, mais on vérifie encore ici)
-  if (request.user.userRole !== 'admin' && request.user.userID.toString() !== id) {
-        return response.status(401).json({ message: "Accès non autorisé à la modification de cet utilisateur." });
-  }
-
-  if (newEmailUser !== null && request.body.email !== user.email) {
-    response.status(409).json({ message: "Email déjà existant, veuillez utiliser une autre adresse !" });
-    return;
+  const user = await User.findById(id).select('+password'); 
+  
+  // Vérification de l'email unique lors de la mise à jour
+  if (request.body.email && request.body.email !== user.email) {
+    const newEmailUser = await User.findOne({ email: request.body.email});
+    if (newEmailUser !== null) {
+        return response.status(409).json({ message: "Email déjà existant, veuillez utiliser une autre adresse !" });
+    }
   }
 
   const updateData = request.body;
   
   // Empêcher les utilisateurs non-admin de changer leur rôle
-  if (request.user.userRole !== "admin") { // Utilisation de request.user.userRole (JWT payload)
+  if (request.user.userRole !== "admin") { 
       delete updateData.role;
   }
 
-  // Gérer la mise à jour du mot de passe (hachage automatique via hook mongoose)
-  if (updateData.password) {
-      // Le hook pre('save') dans bd.js hache le mot de passe avant l'enregistrement
-      const updatedUser = await User.findByIdAndUpdate(
-          id,
-          { ...updateData }, // Mongoose et son hook gèrent le hachage
-          { new: true, runValidators: true }
-      ).select('-password'); 
+  // Le hook pre('save') dans db.js gère le hachage du nouveau mot de passe (s'il est fourni)
+  const updatedUser = await User.findByIdAndUpdate(
+      id,
+      updateData,
+      { new: true, runValidators: true } 
+  ).select('-password'); 
 
-      if (!updatedUser) {
-        response.status(404).json({ message: "Utilisateur inexistant !" });
-        return;
-      }
-      response.status(200).json({ message:`L'utilisateur ${id} a été modifié avec succès !` , user: updatedUser});
-  } else {
-      // Si aucun nouveau mot de passe, mettre à jour les autres champs normalement
-      const updatedUser = await User.findByIdAndUpdate(
-        id,
-        updateData,
-        { new: true, runValidators: true }
-      ).select('-password');
-
-      if (!updatedUser) {
-        response.status(404).json({ message: "Utilisateur inexistant !" });
-        return;
-      }
-      response.status(200).json({ message:`L'utilisateur ${id} a été modifié avec succès !` , user: updatedUser});
+  if (!updatedUser) {
+    response.status(404).json({ message: "Utilisateur inexistant !" });
+    return;
   }
+  response.status(200).json({ message:`L'utilisateur ${id} a été modifié avec succès !` , user: updatedUser});
 });
 
 
